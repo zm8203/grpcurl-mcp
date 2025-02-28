@@ -14,13 +14,14 @@ This project is an Model Context Protocol (MCP) server designed to interact with
 - `grpcurl` tool installed on your system
 
 ## Setup
+1. install grpcurl: https://github.com/fullstorydev/grpcurl
 
-1. Install the package:
+2. Install the package:
    ```bash
    go install github.com/wricardo/mcp-grpcurl@latest
    ```
 
-2. Configure Cline by adding the following to your MCP settings:
+3. Configure Cline by adding the following to your MCP settings:
    ```json
    "mcp-grpcurl": {
      "command": "mcp-grpcurl",
