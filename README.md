@@ -28,11 +28,7 @@ This project is an Model Context Protocol (MCP) server designed to interact with
        "ADDRESS": "localhost:8005"
      },
      "disabled": false,
-     "autoApprove": [
-       "listGrpcServices",
-       "describeGrpcService",
-       "describeGrpcServiceOrMessage"
-     ]
+     "autoApprove": []
    }
    ```
 
