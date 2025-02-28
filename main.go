@@ -126,7 +126,7 @@ Note: Slash notation (e.g., "mypackage.MyService/MyMethod") is used for invoking
 			if !ok {
 				return toolError(fmt.Sprintf("entity '%v' is not a string", entity)), nil
 			}
-			out, err := runGrpcurl(ctx, g.host, "describe", entityStr)
+			out, err := runGrpcurl2(ctx, g.host, "describe", entityStr)
 			if err != nil {
 				return toolError(err.Error()), nil
 			}
@@ -135,6 +135,26 @@ Note: Slash notation (e.g., "mypackage.MyService/MyMethod") is used for invoking
 
 		return toolSuccess(strings.Join(outs, "\n")), nil
 	})
+}
+
+func runGrpcurl2(ctx context.Context, host, subcmd string, entity string, additionalArgs ...string) (string, error) {
+	args := append(additionalArgs, "-plaintext", host, subcmd, entity)
+	cmd := exec.CommandContext(ctx, "grpcurl", args...)
+
+	// Capture stderr for error details.
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return "", fmt.Errorf("failed to get stderr pipe: %w", err)
+	}
+
+	// Execute the command and capture stdout.
+	stdout, err := cmd.Output()
+	if err != nil {
+		stderrBytes, _ := io.ReadAll(stderrPipe)
+		fakeCmd := fmt.Sprintf("grpcurl %s", strings.Join(args, " "))
+		return "", fmt.Errorf("grpcurl command (%s) failed: %w\nstdout: %s\nstderr: %s", fakeCmd, err, string(stdout), string(stderrBytes))
+	}
+	return string(stdout), nil
 }
 
 // runGrpcurl executes the grpcurl command with the provided arguments.
@@ -162,7 +182,6 @@ func runGrpcurl(ctx context.Context, host, subcmd string, additionalArgs ...stri
 }
 
 func main() {
-
 	grpcServer := NewGrpcReflectionServer(os.Getenv("ADDRESS"))
 	if err := grpcServer.Serve(); err != nil && err != io.EOF {
 		log.Fatal("Error serving MCP server:", err)
