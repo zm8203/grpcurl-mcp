@@ -87,10 +87,10 @@ Parameters:
 		return toolSuccess(out), nil
 	})
 
-	// Tool 2: listGrpcServices
+	// Tool 2: list
 	// This tool lists all available gRPC services on the target server using reflection.
 	listTool := mcp.NewTool(
-		"listGrpcServices",
+		"list",
 		mcp.WithDescription("Lists all available gRPC services on the target server using reflection."),
 	)
 	g.srv.AddTool(listTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -142,7 +142,7 @@ Note: Slash notation (e.g., "mypackage.MyService/MyMethod") is used for invoking
 //
 //	grpcurl -plaintext <host> <subcommand> [additional arguments...]
 func runGrpcurl(ctx context.Context, host, subcmd string, additionalArgs ...string) (string, error) {
-	args := append([]string{"-plaintext", host, subcmd}, additionalArgs...)
+	args := append(additionalArgs, "-plaintext", host, subcmd)
 	cmd := exec.CommandContext(ctx, "grpcurl", args...)
 
 	// Capture stderr for error details.
