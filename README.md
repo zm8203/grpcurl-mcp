@@ -41,23 +41,13 @@ mcp-grpc-client
 
 ### Tools
 
-- **invokeGrpcMethodWithOptions**: Invoke a gRPC method using reflection.
+- **invoke**: Invoke a gRPC method using reflection.
   - Parameters:
     - `method`: Fully-qualified method name (e.g., `package.Service/Method`).
     - `request`: JSON payload for the request.
     - `headers`: (Optional) JSON object for custom gRPC headers.
 
-- **listGrpcServices**: List all available gRPC services on the target server.
+- **list**: List all available gRPC services on the target server.
 
-- **describeGrpcServiceOrMessage**: Describe a gRPC service or message type.
+- **describe**: Describe a gRPC service or message type.
   - Use dot notation for symbols (e.g., `mypackage.MyService`).
-
-## Dependencies
-
-- `github.com/davecgh/go-spew` v1.1.1
-- `github.com/mark3labs/mcp-go` v0.8.5
-- `github.com/google/uuid` v1.6.0 (indirect)
-
-## License
-
-This project is licensed under the MIT License.
