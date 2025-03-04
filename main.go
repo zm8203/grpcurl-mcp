@@ -19,9 +19,30 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/reflection/grpc_reflection_v1alpha"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/descriptorpb"
 )
+
+// customEventHandler extends the DefaultEventHandler to capture headers and trailers
+type customEventHandler struct {
+	*grpcurl.DefaultEventHandler
+	headers  metadata.MD
+	trailers metadata.MD
+}
+
+// OnReceiveTrailers captures the incoming trailer metadata
+func (h *customEventHandler) OnReceiveTrailers(status *status.Status, md metadata.MD) {
+	if h.trailers == nil {
+		h.trailers = md
+	} else {
+		for k, v := range md {
+			h.trailers[k] = append(h.trailers[k], v...)
+		}
+	}
+	h.DefaultEventHandler.OnReceiveTrailers(status, md)
+}
 
 // NewGrpcReflectionServer creates a new GrpcReflectionServer for the given target address.
 func NewGrpcReflectionServer(host string) *GrpcReflectionServer {
@@ -108,16 +129,16 @@ Parameters:
 			return toolError("Failed to create formatter: " + err.Error()), nil
 		}
 
-		// Create an event handler using the formDefaultEventHandler{}atter and output buffer.
-
-		handler := &grpcurl.DefaultEventHandler{
-			Out:            &outputBuffer,
-			Formatter:      formatter,
-			VerbosityLevel: 0,
-			NumResponses:   0,
-			Status:         nil,
+		// Create a custom event handler with header capture capability
+		handler := &customEventHandler{
+			DefaultEventHandler: &grpcurl.DefaultEventHandler{
+				Out:            &outputBuffer,
+				Formatter:      formatter,
+				VerbosityLevel: 0,
+				NumResponses:   0,
+				Status:         nil,
+			},
 		}
-		// (&outputBuffer, descSource, formatter, true)
 
 		// Create a request supplier that supplies a single JSON message.
 		reqSupplier := &singleMessageSupplier{
@@ -125,7 +146,6 @@ Parameters:
 		}
 
 		// Invoke the gRPC method using the new API signature.
-		// type RequestSupplier func(proto.Message) error
 		err = grpcurl.InvokeRPC(ctx, descSource, cc, method, headers, handler, reqSupplier.Supply)
 		if err != nil {
 			return toolError("Failed to invoke RPC: " + err.Error()), nil
@@ -136,8 +156,28 @@ Parameters:
 			return toolError(fmt.Sprintf("RPC failed: %v", handler.Status.Err())), nil
 		}
 
-		// Return the result.
-		return toolSuccess(outputBuffer.String()), nil
+		// Convert metadata.MD to map for JSON marshaling
+		headersMap := metadataToMap(handler.headers)
+		trailersMap := metadataToMap(handler.trailers)
+
+		// Create a structured response with headers and trailers
+		response := map[string]interface{}{
+			"body":     outputBuffer.String(),
+			"headers":  headersMap,
+			"trailers": trailersMap,
+			"metadata": map[string]interface{}{
+				"status_code": handler.Status.Code().String(),
+			},
+		}
+
+		// Convert the response to JSON.
+		jsonResponse, err := json.MarshalIndent(response, "", "  ")
+		if err != nil {
+			return toolError("Failed to marshal response: " + err.Error()), nil
+		}
+
+		// Return the structured response.
+		return toolSuccess(string(jsonResponse)), nil
 	})
 
 	// Tool 2: list
@@ -229,7 +269,8 @@ Note: Slash notation (e.g., "mypackage.MyService/MyMethod") is used for invoking
 			for _, entity := range entities {
 				entityStr, ok := entity.(string)
 				if !ok {
-					return toolError(fmt.Sprintf("Failed to resolve symbol %q: %v", entity, err)), nil
+					given, _ := json.Marshal(entity)
+					return toolError(fmt.Sprintf("entities argument should be an array of strings instead of %s", given)), nil
 				}
 				tmp = append(tmp, entityStr)
 			}
@@ -331,6 +372,20 @@ Note: Slash notation (e.g., "mypackage.MyService/MyMethod") is used for invoking
 	})
 
 	return
+}
+
+// metadataToMap converts gRPC metadata to a map suitable for JSON marshaling
+func metadataToMap(md metadata.MD) map[string]interface{} {
+	result := make(map[string]interface{})
+	for key, values := range md {
+		// If there's only one value, store it directly rather than as an array
+		if len(values) == 1 {
+			result[key] = values[0]
+		} else if len(values) > 0 {
+			result[key] = values
+		}
+	}
+	return result
 }
 
 // singleMessageSupplier implements grpcurl.RequestSupplier interface for a single message.
