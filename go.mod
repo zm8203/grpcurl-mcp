@@ -1,4 +1,4 @@
-module github.com/wricardo/mcp-grpcurl
+module github.com/wricardo/grpcurl-mcp
 
 go 1.23.0
 
