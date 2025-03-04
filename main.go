@@ -1,20 +1,29 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"strings"
+	"time"
 
+	"github.com/fullstorydev/grpcurl"
+	"github.com/golang/protobuf/jsonpb"
+	"github.com/golang/protobuf/proto" //lint:ignore SA1019 same as above
+	"github.com/jhump/protoreflect/desc"
+	"github.com/jhump/protoreflect/grpcreflect"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection/grpc_reflection_v1alpha"
+	"google.golang.org/protobuf/types/descriptorpb"
 )
 
-// NewGrpcReflectionServer creates a new GrpcReflectionServer for the given target address (e.g., "localhost:8010").
+// NewGrpcReflectionServer creates a new GrpcReflectionServer for the given target address.
 func NewGrpcReflectionServer(host string) *GrpcReflectionServer {
 	srv := server.NewMCPServer(
 		"grpcReflectionServer",
@@ -39,16 +48,11 @@ func (g *GrpcReflectionServer) Serve() error {
 // registerTools registers the grpcurl-based tools available via the MCP server.
 func (g *GrpcReflectionServer) registerTools() {
 	// Tool 1: invoke
-	// This tool invokes a gRPC method using reflection.
-	// Parameters:
-	//   - "method": Fully-qualified method name in slash notation (e.g., "package.Service/Method").
-	//   - "request": JSON request payload.
-	//   - "headers": (Optional) JSON object for custom gRPC metadata headers.
 	invokeTool := mcp.NewTool(
 		"invoke",
 		mcp.WithDescription(`Invokes a gRPC method using reflection.
 Parameters:
- - "method": Fully-qualified method name (e.g., package.Service/Method). (Use slash notation to invoke.)
+ - "method": Fully-qualified method name (e.g., package.Service/Method).
  - "request": JSON payload for the request.
  - "headers": (Optional) JSON object for custom gRPC headers, e.g. {"Authorization": "Bearer <token>"}.`),
 		mcp.WithString("method", mcp.Description("Fully-qualified method name (e.g., package.Service/Method)"), mcp.Required()),
@@ -57,55 +61,131 @@ Parameters:
 	)
 	g.srv.AddTool(invokeTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := request.Params.Arguments
-
 		method, _ := args["method"].(string)
 		reqPayload, _ := args["request"].(string)
 		headersJSON, _ := args["headers"].(string)
 
-		// Build grpcurl arguments.
-		grpcArgs := []string{}
-
-		// Process custom headers if provided.
+		// Parse headers if provided.
+		headers := []string{}
 		if headersJSON != "" {
 			meta := map[string]string{}
 			if err := json.Unmarshal([]byte(headersJSON), &meta); err != nil {
 				return toolError("Failed to parse headers JSON: " + err.Error()), nil
 			}
 			for k, v := range meta {
-				grpcArgs = append(grpcArgs, "-H", fmt.Sprintf("%s: %s", k, v))
+				headers = append(headers, fmt.Sprintf("%s: %s", k, v))
 			}
 		}
 
-		// Append the JSON request payload.
-		grpcArgs = append(grpcArgs, "-d", reqPayload)
+		// Create a gRPC client connection.
+		network := "tcp"
+		target := g.host
+		dialTime := 10 * time.Second
 
-		// Execute the grpcurl command.
-		out, err := runGrpcurl(ctx, g.host, method, grpcArgs...)
-		if err != nil {
-			return toolError(err.Error()), nil
+		dialOptions := []grpc.DialOption{
+			grpc.WithBlock(),
+			grpc.WithTimeout(dialTime),
+			grpc.WithInsecure(), // adjust based on security requirements.
 		}
-		return toolSuccess(out), nil
+
+		cc, err := grpcurl.BlockingDial(ctx, network, target, nil, dialOptions...)
+		if err != nil {
+			return toolError("Failed to create gRPC connection: " + err.Error()), nil
+		}
+		defer cc.Close()
+
+		// Create a reflection client and descriptor source.
+		refClient := grpcreflect.NewClient(ctx, grpc_reflection_v1alpha.NewServerReflectionClient(cc))
+		defer refClient.Reset()
+		descSource := grpcurl.DescriptorSourceFromServer(ctx, refClient)
+
+		// Create an in-memory buffer to capture output.
+		var outputBuffer bytes.Buffer
+
+		// Create a formatter (we don't need the parser in the new API).
+		_, formatter, err := grpcurl.RequestParserAndFormatter(grpcurl.FormatJSON, descSource, &outputBuffer, grpcurl.FormatOptions{})
+		if err != nil {
+			return toolError("Failed to create formatter: " + err.Error()), nil
+		}
+
+		// Create an event handler using the formDefaultEventHandler{}atter and output buffer.
+
+		handler := &grpcurl.DefaultEventHandler{
+			Out:            &outputBuffer,
+			Formatter:      formatter,
+			VerbosityLevel: 0,
+			NumResponses:   0,
+			Status:         nil,
+		}
+		// (&outputBuffer, descSource, formatter, true)
+
+		// Create a request supplier that supplies a single JSON message.
+		reqSupplier := &singleMessageSupplier{
+			data: []byte(reqPayload),
+		}
+
+		// Invoke the gRPC method using the new API signature.
+		// type RequestSupplier func(proto.Message) error
+		err = grpcurl.InvokeRPC(ctx, descSource, cc, method, headers, handler, reqSupplier.Supply)
+		if err != nil {
+			return toolError("Failed to invoke RPC: " + err.Error()), nil
+		}
+
+		// Check if there was an error status from the RPC
+		if handler.Status != nil && handler.Status.Err() != nil {
+			return toolError(fmt.Sprintf("RPC failed: %v", handler.Status.Err())), nil
+		}
+
+		// Return the result.
+		return toolSuccess(outputBuffer.String()), nil
 	})
 
 	// Tool 2: list
-	// This tool lists all available gRPC services on the target server using reflection.
 	listTool := mcp.NewTool(
 		"list",
 		mcp.WithDescription("Lists all available gRPC services on the target server using reflection."),
 	)
 	g.srv.AddTool(listTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		out, err := runGrpcurl(ctx, g.host, "list")
-		if err != nil {
-			return toolError(err.Error()), nil
+		// Create a gRPC client connection
+		network := "tcp"
+		target := g.host
+		dialTime := 10 * time.Second
+
+		dialOptions := []grpc.DialOption{
+			grpc.WithBlock(),
+			grpc.WithTimeout(dialTime),
+			grpc.WithInsecure(),
 		}
-		return toolSuccess(out), nil
+
+		cc, err := grpcurl.BlockingDial(ctx, network, target, nil, dialOptions...)
+		if err != nil {
+			return toolError("Failed to create gRPC connection: " + err.Error()), nil
+		}
+		defer cc.Close()
+
+		// Create a reflection client
+		refClient := grpcreflect.NewClient(ctx, grpc_reflection_v1alpha.NewServerReflectionClient(cc))
+		defer refClient.Reset()
+
+		// List all services
+		services, err := refClient.ListServices()
+		if err != nil {
+			return toolError("Failed to list services: " + err.Error()), nil
+		}
+
+		// Format the output similarly to grpcurl
+		var output strings.Builder
+		for _, svc := range services {
+			if svc != "grpc.reflection.v1alpha.ServerReflection" {
+				output.WriteString(svc)
+				output.WriteString("\n")
+			}
+		}
+
+		return toolSuccess(output.String()), nil
 	})
 
 	// Tool 3: describe
-	// This tool describes a gRPC service or message type.
-	// Note: The grpcurl "describe" command works with symbols in dot notation.
-	// For example, to describe a service, use "mypackage.MyService" (not "mypackage.MyService/MyMethod").
-	// To see method details, describe the service and then inspect the request/response message types.
 	describeTool := mcp.NewTool(
 		"describe",
 		mcp.WithDescription(`Describes a gRPC service or message type.
@@ -118,71 +198,163 @@ Note: Slash notation (e.g., "mypackage.MyService/MyMethod") is used for invoking
 		WithStringArray("entities", mcp.Description("The services or messages type to describe (use dot notation)"), mcp.Required()),
 	)
 	g.srv.AddTool(describeTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args := request.Params.Arguments
-		entities, _ := args["entities"].([]interface{})
-		outs := []string{}
-		for _, entity := range entities {
-			entityStr, ok := entity.(string)
-			if !ok {
-				return toolError(fmt.Sprintf("entity '%v' is not a string", entity)), nil
-			}
-			out, err := runGrpcurl2(ctx, g.host, "describe", entityStr)
-			if err != nil {
-				return toolError(err.Error()), nil
-			}
-			outs = append(outs, entityStr, out)
+		// Create a gRPC client connection
+		network := "tcp"
+		target := g.host
+		dialTime := 10 * time.Second
+
+		dialOptions := []grpc.DialOption{
+			grpc.WithBlock(),
+			grpc.WithTimeout(dialTime),
+			grpc.WithInsecure(),
 		}
 
-		return toolSuccess(strings.Join(outs, "\n")), nil
+		cc, err := grpcurl.BlockingDial(ctx, network, target, nil, dialOptions...)
+		if err != nil {
+			return toolError("Failed to create gRPC connection: " + err.Error()), nil
+		}
+		defer cc.Close()
+
+		// Create a reflection client and descriptor source
+		refClient := grpcreflect.NewClient(ctx, grpc_reflection_v1alpha.NewServerReflectionClient(cc))
+		defer refClient.Reset()
+		descSource := grpcurl.DescriptorSourceFromServer(ctx, refClient)
+
+		args := request.Params.Arguments
+		entities, ok := args["entities"].(string)
+		var tmp []string
+		if ok {
+			tmp = strings.Split(entities, ",")
+		} else if entities, ok := args["entities"].([]interface{}); ok {
+			for _, entity := range entities {
+				entityStr, ok := entity.(string)
+				if !ok {
+					return toolError(fmt.Sprintf("Failed to resolve symbol %q: %v", entity, err)), nil
+				}
+				tmp = append(tmp, entityStr)
+			}
+		}
+
+		// Split the entities by comma
+		if len(tmp) == 0 {
+			return toolError("No entities provided"), nil
+		}
+
+		var results []string
+
+		for _, entityStr := range tmp {
+			// Remove leading dot if present
+			if entityStr != "" && entityStr[0] == '.' {
+				entityStr = entityStr[1:]
+			}
+
+			// Find the symbol
+			dsc, err := descSource.FindSymbol(entityStr)
+			if err != nil {
+				return toolError(fmt.Sprintf("Failed to resolve symbol %q: %v", entityStr, err)), nil
+			}
+
+			fqn := dsc.GetFullyQualifiedName()
+			var elementType string
+
+			// Determine the type of the descriptor
+			switch d := dsc.(type) {
+			case *desc.MessageDescriptor:
+				elementType = "a message"
+				if parent, ok := d.GetParent().(*desc.MessageDescriptor); ok {
+					if d.IsMapEntry() {
+						for _, f := range parent.GetFields() {
+							if f.IsMap() && f.GetMessageType() == d {
+								elementType = "the entry type for a map field"
+								dsc = f
+								break
+							}
+						}
+					} else {
+						for _, f := range parent.GetFields() {
+							if f.GetType() == descriptorpb.FieldDescriptorProto_TYPE_GROUP && f.GetMessageType() == d {
+								elementType = "the type of a group field"
+								dsc = f
+								break
+							}
+						}
+					}
+				}
+			case *desc.FieldDescriptor:
+				elementType = "a field"
+				if d.GetType() == descriptorpb.FieldDescriptorProto_TYPE_GROUP {
+					elementType = "a group field"
+				} else if d.IsExtension() {
+					elementType = "an extension"
+				}
+			case *desc.OneOfDescriptor:
+				elementType = "a one-of"
+			case *desc.EnumDescriptor:
+				elementType = "an enum"
+			case *desc.EnumValueDescriptor:
+				elementType = "an enum value"
+			case *desc.ServiceDescriptor:
+				elementType = "a service"
+			case *desc.MethodDescriptor:
+				elementType = "a method"
+			default:
+				return toolError(fmt.Sprintf("descriptor has unrecognized type %T", dsc)), nil
+			}
+
+			// Get the descriptor text
+			txt, err := grpcurl.GetDescriptorText(dsc, descSource)
+			if err != nil {
+				return toolError(fmt.Sprintf("Failed to describe symbol %q: %v", entityStr, err)), nil
+			}
+
+			description := fmt.Sprintf("%s is %s:\n%s", fqn, elementType, txt)
+
+			// // For message types, also show a JSON template
+			// if msgDesc, ok := dsc.(*desc.MessageDescriptor); ok {
+			// 	tmpl := grpcurl.MakeTemplate(msgDesc)
+			// 	options := grpcurl.FormatOptions{EmitJSONDefaultFields: true}
+			// 	_, formatter, err := grpcurl.RequestParserAndFormatter(grpcurl.FormatJSON, descSource, nil, options)
+			// 	if err != nil {
+			// 		return toolError(fmt.Sprintf("Failed to create formatter: %v", err)), nil
+			// 	}
+			// 	str, err := formatter(tmpl)
+			// 	if err != nil {
+			// 		return toolError(fmt.Sprintf("Failed to print template for message %s: %v", entityStr, err)), nil
+			// 	}
+			// 	description += "\nMessage template:\n" + str
+			// }
+
+			results = append(results, description)
+		}
+
+		return toolSuccess(strings.Join(results, "\n\n")), nil
 	})
+
+	return
 }
 
-func runGrpcurl2(ctx context.Context, host, subcmd string, entity string, additionalArgs ...string) (string, error) {
-	args := append(additionalArgs, "-plaintext", host, subcmd, entity)
-	cmd := exec.CommandContext(ctx, "grpcurl", args...)
-
-	// Capture stderr for error details.
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return "", fmt.Errorf("failed to get stderr pipe: %w", err)
-	}
-
-	// Execute the command and capture stdout.
-	stdout, err := cmd.Output()
-	if err != nil {
-		stderrBytes, _ := io.ReadAll(stderrPipe)
-		fakeCmd := fmt.Sprintf("grpcurl %s", strings.Join(args, " "))
-		return "", fmt.Errorf("grpcurl command (%s) failed: %w\nstdout: %s\nstderr: %s", fakeCmd, err, string(stdout), string(stderrBytes))
-	}
-	return string(stdout), nil
+// singleMessageSupplier implements grpcurl.RequestSupplier interface for a single message.
+type singleMessageSupplier struct {
+	data []byte
+	used bool
 }
 
-// runGrpcurl executes the grpcurl command with the provided arguments.
-// The command structure is:
-//
-//	grpcurl -plaintext <host> <subcommand> [additional arguments...]
-func runGrpcurl(ctx context.Context, host, subcmd string, additionalArgs ...string) (string, error) {
-	args := append(additionalArgs, "-plaintext", host, subcmd)
-	cmd := exec.CommandContext(ctx, "grpcurl", args...)
-
-	// Capture stderr for error details.
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return "", fmt.Errorf("failed to get stderr pipe: %w", err)
+// Supply implements the grpcurl.RequestSupplier interface.
+func (s *singleMessageSupplier) Supply(msg proto.Message) error {
+	if s.used {
+		return io.EOF
 	}
-
-	// Execute the command and capture stdout.
-	stdout, err := cmd.Output()
-	if err != nil {
-		stderrBytes, _ := io.ReadAll(stderrPipe)
-		fakeCmd := fmt.Sprintf("grpcurl %s", strings.Join(args, " "))
-		return "", fmt.Errorf("grpcurl command (%s) failed: %w\nstdout: %s\nstderr: %s", fakeCmd, err, string(stdout), string(stderrBytes))
-	}
-	return string(stdout), nil
+	s.used = true
+	return jsonpb.Unmarshal(bytes.NewReader(s.data), msg)
 }
 
 func main() {
-	grpcServer := NewGrpcReflectionServer(os.Getenv("ADDRESS"))
+	address := os.Getenv("ADDRESS")
+	if address == "" {
+		log.Fatal("ADDRESS environment variable is required")
+		os.Exit(1)
+	}
+	grpcServer := NewGrpcReflectionServer(address)
 	if err := grpcServer.Serve(); err != nil && err != io.EOF {
 		log.Fatal("Error serving MCP server:", err)
 		os.Exit(1)
@@ -190,7 +362,6 @@ func main() {
 }
 
 // WithStringArray adds a string array property to the tool schema.
-// It accepts property options to configure the string array property's behavior and constraints.
 func WithStringArray(name string, opts ...mcp.PropertyOption) mcp.ToolOption {
 	return func(t *mcp.Tool) {
 		schema := map[string]interface{}{
@@ -204,7 +375,6 @@ func WithStringArray(name string, opts ...mcp.PropertyOption) mcp.ToolOption {
 			opt(schema)
 		}
 
-		// Remove required from property schema and add to InputSchema.required
 		if required, ok := schema["required"].(bool); ok && required {
 			delete(schema, "required")
 			if t.InputSchema.Required == nil {
