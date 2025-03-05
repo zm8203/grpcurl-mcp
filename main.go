@@ -53,8 +53,9 @@ func NewGrpcReflectionServer(host string) *GrpcReflectionServer {
 	)
 
 	grs := &GrpcReflectionServer{
-		srv:  srv,
-		host: host,
+		srv:     srv,
+		host:    host,
+		headers: make(map[string]string),
 	}
 
 	grs.registerTools()
@@ -68,6 +69,51 @@ func (g *GrpcReflectionServer) Serve() error {
 
 // registerTools registers the grpcurl-based tools available via the MCP server.
 func (g *GrpcReflectionServer) registerTools() {
+	// Tool: set-headers
+	setHeadersTool := mcp.NewTool(
+		"set-headers",
+		mcp.WithDescription(`Set global headers to be used with all future gRPC requests.
+Parameters:
+ - "headers": JSON object with header key-value pairs, e.g. {"Authorization": "Bearer <token>"}.
+ - "clear": (Optional) Boolean to clear all existing headers before setting new ones.`),
+		mcp.WithString("headers", mcp.Description("JSON object with header key-value pairs"), mcp.Required()),
+		mcp.WithBoolean("clear", mcp.Description("Clear existing headers before setting new ones")),
+	)
+	g.srv.AddTool(setHeadersTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := request.Params.Arguments
+		headersJSON, _ := args["headers"].(string)
+		clear, _ := args["clear"].(bool)
+
+		// Parse headers
+		newHeaders := make(map[string]string)
+		if err := json.Unmarshal([]byte(headersJSON), &newHeaders); err != nil {
+			return toolError("Failed to parse headers JSON: " + err.Error()), nil
+		}
+
+		// Clear existing headers if requested
+		if clear {
+			g.headers = make(map[string]string)
+		}
+
+		// Update headers
+		for k, v := range newHeaders {
+			g.headers[k] = v
+		}
+
+		// Format headers for display
+		headersMap := make(map[string]interface{})
+		for k, v := range g.headers {
+			headersMap[k] = v
+		}
+
+		jsonResponse, err := json.MarshalIndent(headersMap, "", "  ")
+		if err != nil {
+			return toolError("Failed to marshal headers: " + err.Error()), nil
+		}
+
+		return toolSuccess(fmt.Sprintf("Headers updated successfully:\n%s", string(jsonResponse))), nil
+	})
+
 	// Tool 1: invoke
 	invokeTool := mcp.NewTool(
 		"invoke",
@@ -75,25 +121,32 @@ func (g *GrpcReflectionServer) registerTools() {
 Parameters:
  - "method": Fully-qualified method name (e.g., package.Service/Method).
  - "request": JSON payload for the request.
- - "headers": (Optional) JSON object for custom gRPC headers, e.g. {"Authorization": "Bearer <token>"}.`),
+ - "headers": (Optional) JSON object for custom gRPC headers that will be merged with global headers.`),
 		mcp.WithString("method", mcp.Description("Fully-qualified method name (e.g., package.Service/Method)"), mcp.Required()),
 		mcp.WithString("request", mcp.Description("JSON request payload"), mcp.Required()),
-		mcp.WithString("headers", mcp.Description("Optional JSON object for custom gRPC headers")),
+		mcp.WithString("headers", mcp.Description("Optional JSON object for request-specific headers")),
 	)
 	g.srv.AddTool(invokeTool, func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := request.Params.Arguments
 		method, _ := args["method"].(string)
 		reqPayload, _ := args["request"].(string)
-		headersJSON, _ := args["headers"].(string)
+		requestHeadersJSON, _ := args["headers"].(string)
 
-		// Parse headers if provided.
+		// Parse request-specific headers if provided and merge with global headers
 		headers := []string{}
-		if headersJSON != "" {
-			meta := map[string]string{}
-			if err := json.Unmarshal([]byte(headersJSON), &meta); err != nil {
+
+		// Start with global headers
+		for k, v := range g.headers {
+			headers = append(headers, fmt.Sprintf("%s: %s", k, v))
+		}
+
+		// Add request-specific headers if provided
+		if requestHeadersJSON != "" {
+			requestHeaders := make(map[string]string)
+			if err := json.Unmarshal([]byte(requestHeadersJSON), &requestHeaders); err != nil {
 				return toolError("Failed to parse headers JSON: " + err.Error()), nil
 			}
-			for k, v := range meta {
+			for k, v := range requestHeaders {
 				headers = append(headers, fmt.Sprintf("%s: %s", k, v))
 			}
 		}
@@ -465,6 +518,7 @@ func toolError(message string) *mcp.CallToolResult {
 
 // GrpcReflectionServer wraps grpcurl functionalities into an MCP server.
 type GrpcReflectionServer struct {
-	srv  *server.MCPServer
-	host string
+	srv     *server.MCPServer
+	host    string
+	headers map[string]string // Global headers to be used with all requests
 }
